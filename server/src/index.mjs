@@ -2,7 +2,7 @@ import express from 'express';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getDb, initDb, bumpRevision } from './db.mjs';
+import { getDb, initDb, bumpRevision, currentRevision } from './db.mjs';
 import { loadConfig, computeResults } from './scoring.mjs';
 import { seedDemo } from './seed.mjs';
 
@@ -113,8 +113,11 @@ app.post('/api/setup', (req, res) => {
 
 // ---------- 打卡导入 ----------
 /**
- * 整批校验：负秒数、同记录号异内容 => 整批拒绝（事务回滚）。
- * 同记录号同内容 => 幂等跳过。
+ * 整批校验：负秒数、同记录号异「原始内容」=> 整批拒绝（事务回滚）。
+ * 同号判定以该记录号【首次入库时】的原始读数（bib/point/seconds/kind）为准，
+ * 不看裁判更正后的现值：
+ *  - 原始内容一致 => 幂等跳过，绝不覆盖现值、作废状态与审计留痕；
+ *  - 原始内容不一致（批内或库内）=> 整批拒绝；即使批次混有新记录也不部分入库。
  */
 app.post('/api/punches/import', (req, res) => {
   if (!checkRevision(req, res)) return;
@@ -141,30 +144,47 @@ app.post('/api/punches/import', (req, res) => {
     if (seen.has(row.record_no)) {
       const prev = seen.get(row.record_no);
       if (prev.bib !== row.bib || prev.point !== row.point || prev.seconds !== row.seconds || prev.kind !== row.kind)
-        return badRequest(res, `记录号 ${row.record_no} 在批次内出现且内容不一致，整批拒绝`);
+        return badRequest(res, `记录号 ${row.record_no} 在批次内出现且原始内容不一致，整批拒绝`);
       continue; // 批次内完全重复，幂等忽略
     }
     seen.set(row.record_no, row);
     rows.push(row);
   }
 
-  const existing = db.prepare('SELECT record_no, bib, point, seconds, kind FROM punch WHERE record_no = ?');
+  // 与库中「首次入库原始读数」比对：更正后的现值不参与冲突判定。
+  const existing = db.prepare(
+    'SELECT record_no, orig_bib, orig_point, orig_seconds, orig_kind FROM punch WHERE record_no = ?'
+  );
   for (const r of rows) {
     const ex = existing.get(r.record_no);
-    if (ex && (ex.bib !== r.bib || ex.point !== r.point || ex.seconds !== r.seconds || ex.kind !== r.kind))
-      return badRequest(res, `记录号 ${r.record_no} 已存在但内容不同，整批拒绝`);
+    if (ex && (ex.orig_bib !== r.bib || ex.orig_point !== r.point ||
+               ex.orig_seconds !== r.seconds || ex.orig_kind !== r.kind))
+      return badRequest(res, `记录号 ${r.record_no} 已存在但原始内容不同，整批拒绝`);
   }
 
   let inserted = 0;
-  const revision = db.transaction(() => {
-    const insRunner = db.prepare('INSERT INTO runner (bib, name) VALUES (?, ?) ON CONFLICT(bib) DO UPDATE SET name = COALESCE(excluded.name, runner.name)');
-    const insPunch = db.prepare('INSERT OR IGNORE INTO punch (record_no, bib, point, seconds, kind) VALUES (@record_no, @bib, @point, @seconds, @kind)');
-    for (const r of rows) {
-      insRunner.run(r.bib, r.name);
-      inserted += insPunch.run(r).changes;
-    }
-    return bumpRevision(db);
-  })();
+  const present = new Set(
+    db.prepare(`SELECT record_no FROM punch WHERE record_no IN (${rows.map(() => '?').join(',')})`)
+      .all(...rows.map((r) => r.record_no))
+      .map((x) => x.record_no)
+  );
+  const toInsert = rows.filter((r) => !present.has(r.record_no));
+  // 仅当确有新记录时才写库/推进修订；全部幂等跳过时为只读操作，修订号不变。
+  let revision = currentRevision(db);
+  if (toInsert.length > 0) {
+    revision = db.transaction(() => {
+      const insRunner = db.prepare('INSERT INTO runner (bib, name) VALUES (?, ?) ON CONFLICT(bib) DO UPDATE SET name = COALESCE(excluded.name, runner.name)');
+      const insPunch = db.prepare(
+        `INSERT INTO punch (record_no, bib, point, seconds, kind, orig_bib, orig_point, orig_seconds, orig_kind)
+         VALUES (@record_no, @bib, @point, @seconds, @kind, @bib, @point, @seconds, @kind)`
+      );
+      for (const r of toInsert) {
+        insRunner.run(r.bib, r.name);
+        inserted += insPunch.run(r).changes;
+      }
+      return bumpRevision(db);
+    })();
+  }
   res.json({ ok: true, inserted, skipped: rows.length - inserted, revision });
 });
 
@@ -173,6 +193,7 @@ app.get('/api/punches', (req, res) => {
   const { bib } = req.query;
   const sql = `
     SELECT p.id, p.record_no, p.bib, r.name AS runner_name, p.point, p.seconds, p.kind,
+           p.orig_point, p.orig_seconds,
            p.status, p.void_reason, p.created_at
     FROM punch p LEFT JOIN runner r ON r.bib = p.bib
     ${bib ? 'WHERE p.bib = ?' : ''}

@@ -58,7 +58,9 @@ export default function Review({ event, onChanged, onError }) {
       <h2>裁判争议复核</h2>
       <p className="muted small">
         作废：该读数不再参与有效链；更正：以新点位/秒数重算成绩。两类操作均<b>保留原值与原因</b>，
-        且立即重算当前成绩（已发布的历史版不受影响）。
+        且立即重算当前成绩（已发布的历史版不受影响）。更正/作废后重新导入原始批次时，
+        系统按<b>首次入库的原始读数</b>识别同号记录并幂等跳过，不会覆盖现值与留痕；
+        表格中以「原始点位/原始秒数」标注初始读数。
       </p>
       <div className="filter">
         <input placeholder="按号码布筛选（留空显示全部）" value={bib} onChange={e => setBib(e.target.value)} />
@@ -80,8 +82,18 @@ export default function Review({ event, onChanged, onError }) {
                     <tr className={p.status === 'voided' ? 'row-void' : ''}>
                       <td>{p.record_no}</td>
                       <td>{KIND_LABEL[p.kind]}</td>
-                      <td>{p.point}</td>
-                      <td>{p.seconds}s（{fmtTime(p.seconds)}）</td>
+                      <td>
+                        {p.point}
+                        {p.orig_point && p.orig_point !== p.point && (
+                          <div className="muted small">原始点位：{p.orig_point}</div>
+                        )}
+                      </td>
+                      <td>
+                        {p.seconds}s（{fmtTime(p.seconds)}）
+                        {p.orig_seconds != null && p.orig_seconds !== p.seconds && (
+                          <div className="muted small">原始秒数：{p.orig_seconds}s</div>
+                        )}
+                      </td>
                       <td>
                         {p.status === 'voided'
                           ? <span className="badge bad">已作废</span>

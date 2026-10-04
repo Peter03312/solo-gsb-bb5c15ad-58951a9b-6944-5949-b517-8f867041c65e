@@ -32,6 +32,9 @@ CREATE TABLE IF NOT EXISTS runner (
 
 -- 打卡原始读数。record_no 全局唯一。
 -- status: active（有效，含被更正后的现值）| voided（裁判作废，不参与核算）
+-- point/seconds/bib/kind 为「现值」（裁判更正会改 point/seconds）；
+-- orig_* 为首次入库时的原始读数，永不随更正/作废/重导改变，
+-- 是批量重导判定「同号内容是否一致」的唯一依据。
 CREATE TABLE IF NOT EXISTS punch (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   record_no  TEXT NOT NULL UNIQUE,
@@ -39,6 +42,10 @@ CREATE TABLE IF NOT EXISTS punch (
   point      TEXT NOT NULL,
   seconds    INTEGER NOT NULL CHECK (seconds >= 0),
   kind       TEXT NOT NULL CHECK (kind IN ('start','enroute','finish')),
+  orig_bib     TEXT NOT NULL,
+  orig_point   TEXT NOT NULL,
+  orig_seconds INTEGER NOT NULL CHECK (orig_seconds >= 0),
+  orig_kind    TEXT NOT NULL CHECK (orig_kind IN ('start','enroute','finish')),
   status     TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','voided')),
   void_reason TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))

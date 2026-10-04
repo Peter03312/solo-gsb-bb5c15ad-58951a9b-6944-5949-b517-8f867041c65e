@@ -70,8 +70,9 @@ export default function Import({ event, onChanged, onError }) {
       <h2>打卡批量导入</h2>
       <ul className="muted small rules">
         <li>每条含 <b>记录号 recordNo</b>、号码布 bib、点位 point、<b>距发枪秒数 seconds</b>、类型 kind(start/enroute/finish)。</li>
-        <li>同一记录号内容完全一致 → 幂等跳过；<b>同记录号异内容，或出现负秒数，整批拒绝、全部不入库</b>。</li>
-        <li>提交时携带当前修订号；赛事已被他人修订时返回 409 与当前修订号，需刷新后重试。</li>
+        <li>同号判定以该记录<b>首次入库的原始读数</b>为准：原始内容完全一致 → 幂等跳过（即使已被裁判更正或作废，也不覆盖现值、状态与审计）。</li>
+        <li><b>同记录号原始内容不同（批内或与库中），或出现负秒数，整批拒绝、全部不入库</b>；批次混有新记录时也不会部分入库。</li>
+        <li>全部为幂等跳过时不推进修订号；只要有新增即修订号 +1。提交须携带当前修订号，赛事已被他人修订时返回 409 与当前修订号，需刷新后重试。</li>
         <li>支持 JSON 数组，或 CSV/TSV（表头：recordNo,bib,point,seconds,kind,name）。</li>
       </ul>
       <textarea className="code-input" rows={14} value={text} onChange={e => setText(e.target.value)} spellCheck="false" />
