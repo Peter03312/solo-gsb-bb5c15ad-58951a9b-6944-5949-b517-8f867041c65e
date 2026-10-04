@@ -102,10 +102,68 @@ npm start          # http://localhost:3000
   避免覆盖他人更改。
 - 发布将**关卡配置 + 全部有效读数（作废读数除外）+ 当次成绩**整体快照写入 `publication` /
   `published_result` 表，版本号递增；历史版只读，后续更正**不修改任何历史版**。
-- 批量导入校验：
+- 批量导入校验（**重导语义**，打卡设备/原始文件可安全反复整批重传）：
   - 秒数必须为非负整数，出现**负秒数 → 整批拒绝**；
-  - **同一记录号内容不同（批次内或与库中冲突）→ 整批拒绝**，事务回滚全部不入库；
-  - 同一记录号内容完全一致 → 幂等跳过。
+  - 同号内容以该 recordNo **首次入库的原始读数**（`recordNo` + `bib` + `point` + `seconds` + `kind`）判定；
+    库中 `punch.point/seconds` 是裁判现值，另存 `orig_point/orig_seconds` 作为首读，二者互不影响；
+  - 重复提交同一原始记录 → **幂等跳过**：不覆盖裁判**更正后的现值**、不复活**作废**记录，也不写入任何审计；
+  - **同号但原始内容不同（批次内互异，或与库内首读不同）→ 整批拒绝**；
+    即使提交值恰好等于裁判更正后的现值，只要不同于首次读数仍拒绝（防止把"更正值"误当成同一条原始记录跳过）；
+  - 整批先校验后写入：批次中混有全新记录时只要存在一条冲突，**新记录也不入库**，绝不部分入库；
+  - 多次更正后仍按**最初读数**判断；实时成绩始终沿用裁判现值，已发布的历史版保持冻结。
+
+### 批量导入调用示例
+
+先取当前修订号：
+
+```bash
+curl -s http://localhost:3000/api/event
+# -> { "configured": true, "revision": 7, ... }
+```
+
+携带 `expectedRevision` 导入；同一条原始记录重复导入返回 `inserted: 0 / skipped: 1`：
+
+```bash
+curl -s -X POST http://localhost:3000/api/punches/import \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "expectedRevision": 7,
+    "punches": [
+      { "recordNo": "R1001", "bib": "007", "name": "周杰", "point": "S",  "seconds": 0,    "kind": "start" },
+      { "recordNo": "R1002", "bib": "007", "point": "A1", "seconds": 320,  "kind": "enroute" },
+      { "recordNo": "R1003", "bib": "007", "point": "B2", "seconds": 780,  "kind": "enroute" },
+      { "recordNo": "R1004", "bib": "007", "point": "F",  "seconds": 1100, "kind": "finish" }
+    ]
+  }'
+# -> { "ok": true, "inserted": 4, "skipped": 0, "revision": 8 }
+```
+
+裁判把 R1003 从 B2@780 更正为 B1@760 后，重传**原始批次**仍幂等跳过（按首读判定，不回滚更正）：
+
+```bash
+curl -s -X POST http://localhost:3000/api/punches/import \
+  -H 'Content-Type: application/json' \
+  -d '{"expectedRevision": 9, "punches": [
+       {"recordNo":"R1003","bib":"007","point":"B2","seconds":780,"kind":"enroute"}]}'
+# -> { "ok": true, "inserted": 0, "skipped": 1, "revision": 10 }
+```
+
+同号但首读不同（哪怕等于更正现值 B1@760）整批拒绝；修订过期返回 409 与当前修订：
+
+```bash
+# 与库内首读冲突：HTTP 400
+# {"error":"记录号 R1003 已存在但原始内容不同，整批拒绝（更正/作废记录请以首次入库读数重导）"}
+curl -i -X POST http://localhost:3000/api/punches/import \
+  -H 'Content-Type: application/json' \
+  -d '{"expectedRevision": 10, "punches": [
+       {"recordNo":"R1003","bib":"007","point":"B1","seconds":760,"kind":"enroute"}]}'
+
+# 修订过期：HTTP 409
+# {"error":"赛事已修订，请刷新后重试","currentRevision":11}
+```
+
+响应字段固定为 `ok`、`inserted`（本批新增条数）、`skipped`（按首读判定的重复条数）、`revision`（导入后的赛事修订号）。
+`GET /api/punches?bib=007` 的每条记录同时返回裁判现值 `point/seconds` 与首次入库读数 `origPoint/origSeconds`。
 
 导入数据格式（JSON 数组，或 `recordNo,bib,point,seconds,kind,name` 的 CSV/TSV）：
 
@@ -151,7 +209,7 @@ server/            Express + better-sqlite3 后端
   src/db.mjs       SQLite 连接/建表/修订号
   src/seed.mjs     演示数据
   src/schema.sql   数据库表结构
-  e2e-test.mjs     端到端断言（35 项，覆盖核算/整批拒绝/修订锁/冻结）
+  e2e-test.mjs     端到端断言（51 项，覆盖核算/整批拒绝/重导语义/修订锁/冻结）
 web/               React + Vite 前端
   src/components/  五个功能页面
 Dockerfile         多阶段构建（前端构建 + 后端 + 运行镜像）
@@ -165,6 +223,6 @@ docker-compose.yml 一键启动、建表、初始化数据，端口 3000
 rm -f data/orienteering.db*
 SEED=1 node server/src/index.mjs
 
-# 终端 2：运行 35 项断言
+# 终端 2：运行 51 项断言
 node server/e2e-test.mjs http://localhost:3000
 ```

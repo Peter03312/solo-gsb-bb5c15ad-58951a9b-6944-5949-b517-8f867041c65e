@@ -30,18 +30,23 @@ CREATE TABLE IF NOT EXISTS runner (
   name TEXT
 );
 
--- 打卡原始读数。record_no 全局唯一。
+-- 打卡记录。record_no 全局唯一。
+-- point/seconds 为裁判现值（更正改现值、作废置 status），实时成绩取现值；
+-- orig_point/orig_seconds 为首次入库时的原始读数，批次重导按其判定同号内容，
+-- 任何更正/作废都不修改原始读数。
 -- status: active（有效，含被更正后的现值）| voided（裁判作废，不参与核算）
 CREATE TABLE IF NOT EXISTS punch (
-  id         INTEGER PRIMARY KEY AUTOINCREMENT,
-  record_no  TEXT NOT NULL UNIQUE,
-  bib        TEXT NOT NULL REFERENCES runner(bib),
-  point      TEXT NOT NULL,
-  seconds    INTEGER NOT NULL CHECK (seconds >= 0),
-  kind       TEXT NOT NULL CHECK (kind IN ('start','enroute','finish')),
-  status     TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','voided')),
-  void_reason TEXT,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_no    TEXT NOT NULL UNIQUE,
+  bib          TEXT NOT NULL REFERENCES runner(bib),
+  point        TEXT NOT NULL,
+  seconds      INTEGER NOT NULL CHECK (seconds >= 0),
+  kind         TEXT NOT NULL CHECK (kind IN ('start','enroute','finish')),
+  orig_point   TEXT NOT NULL DEFAULT '',
+  orig_seconds INTEGER NOT NULL DEFAULT 0,
+  status       TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','voided')),
+  void_reason  TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_punch_bib ON punch(bib);
 

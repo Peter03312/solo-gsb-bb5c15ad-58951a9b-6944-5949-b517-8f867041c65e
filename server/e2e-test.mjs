@@ -107,7 +107,73 @@ console.log('5) 作废/更正留痕并重算');
   ok('审计保留原值 ZZ@99999', a && a.origPoint === 'ZZ' && a.origSeconds === 99999 && a.newPoint === 'B2' && a.reason === '现场记录更正');
 }
 
-console.log('6) 发布冻结与历史版不可变');
+console.log('6) 更正/作废后的重导语义（按首次入库原始读数判定）');
+{
+  const r0 = await rev();
+  // id 17 = R0032：现值 B2@700，首次入库读数 ZZ@99999（第 5 节已更正）
+  const reOrig = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r0, punches: [
+    { recordNo: 'R0032', bib: '004', point: 'ZZ', seconds: 99999, kind: 'enroute' },
+  ]})});
+  ok('按首读重导更正记录：200 幂等跳过', reOrig.status === 200 && reOrig.body.inserted === 0 && reOrig.body.skipped === 1, JSON.stringify(reOrig.body));
+  const p17a = (await call('/api/punches?bib=004')).body.punches.find(x => x.record_no === 'R0032');
+  ok('重导不覆盖更正现值且首读保留', p17a.point === 'B2' && p17a.seconds === 700 && p17a.origPoint === 'ZZ' && p17a.origSeconds === 99999);
+  const audits4a = (await call('/api/punches?bib=004')).body.audits;
+  ok('重导不新增审计', audits4a.filter(a => a.punchId === 17).length === 1);
+
+  const r1 = await rev();
+  const reCurrent = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r1, punches: [
+    { recordNo: 'R0032', bib: '004', point: 'B2', seconds: 700, kind: 'enroute' },
+  ]})});
+  ok('提交值等于更正现值但异于首读：整批拒绝', reCurrent.status === 400 && /R0032/.test(reCurrent.body.error), JSON.stringify(reCurrent.body));
+
+  const r2 = await rev();
+  const mixed = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r2, punches: [
+    { recordNo: 'R0700', bib: '010', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'R0032', bib: '004', point: 'B2', seconds: 700, kind: 'enroute' },
+  ]})});
+  ok('冲突混新记录整批拒绝', mixed.status === 400);
+  const afterMixed = await call('/api/punches?bib=010');
+  ok('不部分入库：010 无任何打卡', afterMixed.body.punches.length === 0);
+  ok('整批拒绝不推进修订', (await rev()) === r2);
+
+  const r3 = await rev();
+  const reVoided = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r3, punches: [
+    { recordNo: 'R0041', bib: '005', point: 'S', seconds: 5, kind: 'start' },
+  ]})});
+  ok('作废记录按首读重导：跳过且不复活', reVoided.status === 200 && reVoided.body.inserted === 0 && reVoided.body.skipped === 1, JSON.stringify(reVoided.body));
+  const p21 = (await call('/api/punches?bib=005')).body.punches.find(x => x.record_no === 'R0041');
+  ok('作废状态与原因保留', p21.status === 'voided' && p21.void_reason === '设备重复上报');
+
+  // 多次更正后仍按最初读数判断
+  const c2 = await call('/api/punches/17/correct', { method: 'POST', body: JSON.stringify({ reason: '二次申诉更正', newPoint: 'B1', newSeconds: 650 }) });
+  ok('二次更正成功', c2.status === 200);
+  const r4 = await rev();
+  const reOrig2 = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r4, punches: [
+    { recordNo: 'R0032', bib: '004', point: 'ZZ', seconds: 99999, kind: 'enroute' },
+  ]})});
+  ok('二次更正后按最初读数重导仍跳过', reOrig2.status === 200 && reOrig2.body.inserted === 0);
+  const p17b = (await call('/api/punches?bib=004')).body.punches.find(x => x.record_no === 'R0032');
+  ok('二次更正现值保留、首读仍是 ZZ@99999', p17b.point === 'B1' && p17b.seconds === 650 && p17b.origPoint === 'ZZ' && p17b.origSeconds === 99999);
+  const audits4b = (await call('/api/punches?bib=004')).body.audits;
+  ok('两次更正各留一条审计', audits4b.filter(a => a.punchId === 17 && a.action === 'correct').length === 2);
+  const rsNow = await resultsByBib();
+  ok('实时成绩沿用裁判现值（004 链取 B1@650）', JSON.stringify(rsNow.get('004').chain.map(c => `${c.point}@${c.seconds}`)).includes('B1@650'));
+
+  // 同批：首读重复记录 + 全新记录混合 => 重复跳过、新记录正常入库
+  const r5 = await rev();
+  const mix2 = await call('/api/punches/import', { method: 'POST', body: JSON.stringify({ expectedRevision: r5, punches: [
+    { recordNo: 'R0032', bib: '004', point: 'ZZ', seconds: 99999, kind: 'enroute' },
+    { recordNo: 'R0801', bib: '009', name: '重导混入', point: 'S', seconds: 0, kind: 'start' },
+    { recordNo: 'R0802', bib: '009', point: 'A2', seconds: 300, kind: 'enroute' },
+    { recordNo: 'R0803', bib: '009', point: 'B1', seconds: 600, kind: 'enroute' },
+    { recordNo: 'R0804', bib: '009', point: 'F', seconds: 800, kind: 'finish' },
+  ]})});
+  ok('首读重复与新记录同批：新增 4 跳过 1', mix2.status === 200 && mix2.body.inserted === 4 && mix2.body.skipped === 1, JSON.stringify(mix2.body));
+  const rs9 = await resultsByBib();
+  ok('009 按新记录完成 800', rs9.get('009').status === 'ok' && rs9.get('009').elapsed === 800);
+}
+
+console.log('7) 发布冻结与历史版不可变');
 {
   const before = await resultsByBib();
   const v005 = before.get('005').elapsed;

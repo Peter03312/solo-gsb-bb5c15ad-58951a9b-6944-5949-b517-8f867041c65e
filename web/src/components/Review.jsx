@@ -80,8 +80,14 @@ export default function Review({ event, onChanged, onError }) {
                     <tr className={p.status === 'voided' ? 'row-void' : ''}>
                       <td>{p.record_no}</td>
                       <td>{KIND_LABEL[p.kind]}</td>
-                      <td>{p.point}</td>
-                      <td>{p.seconds}s（{fmtTime(p.seconds)}）</td>
+                      <td>
+                        {p.point}
+                        {p.origPoint !== p.point && <div className="muted small">首次入库：{p.origPoint}</div>}
+                      </td>
+                      <td>
+                        {p.seconds}s（{fmtTime(p.seconds)}）
+                        {p.origSeconds !== p.seconds && <div className="muted small">首次入库：{p.origSeconds}s</div>}
+                      </td>
                       <td>
                         {p.status === 'voided'
                           ? <span className="badge bad">已作废</span>

@@ -26,8 +26,10 @@ export function seedDemo(db) {
     insRunner.run('005', '陈晨'); insRunner.run('006', '孙磊');
 
     // record_no 全局唯一；kind: start | enroute | finish
+    // 首次入库：现值与原始读数相同（orig_* 永不随更正/作废改变）
     const insP = db.prepare(
-      `INSERT INTO punch (record_no, bib, point, seconds, kind) VALUES (?, ?, ?, ?, ?)`
+      `INSERT INTO punch (record_no, bib, point, seconds, kind, orig_point, orig_seconds)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
     );
     const rows = [
       // 001 张明：正常完成 910s（多余的逆序打卡 A2 不作依据）
@@ -53,7 +55,7 @@ export function seedDemo(db) {
       ['R0052','006','B1',700,'enroute'], ['R0053','006','F',1000,'finish'],
     ];
     const tx = db.transaction(() => {
-      for (const r of rows) insP.run(...r);
+      for (const r of rows) insP.run(r[0], r[1], r[2], r[3], r[4], r[2], r[3]);
       // 关卡初始为修订 #1，演示读数导入后推进
       bumpRevision(db);
       db.prepare('INSERT INTO meta (k, v) VALUES (?, ?)').run('seeded', '1');

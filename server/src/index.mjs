@@ -113,8 +113,12 @@ app.post('/api/setup', (req, res) => {
 
 // ---------- 打卡导入 ----------
 /**
- * 整批校验：负秒数、同记录号异内容 => 整批拒绝（事务回滚）。
- * 同记录号同内容 => 幂等跳过。
+ * 整批校验：负秒数、同记录号异「原始内容」=> 整批拒绝（事务回滚，新记录也不入库）。
+ * 同号内容以 recordNo + bib + point + seconds + kind 的首次入库读数为准
+ * （punch.orig_*），与裁判更正后的现值/作废状态无关：
+ *   - 原始记录重复出现 => 幂等跳过，绝不覆盖更正现值、作废状态与审计留痕；
+ *   - 同号但原始内容不同（批内互异，或与库内首读不同）=> 整批拒绝；
+ *   - 即使提交值恰好等于更正现值，只要不同于首次读数仍属冲突。
  */
 app.post('/api/punches/import', (req, res) => {
   if (!checkRevision(req, res)) return;
@@ -122,6 +126,10 @@ app.post('/api/punches/import', (req, res) => {
   const { punches } = req.body || {};
   if (!Array.isArray(punches) || punches.length === 0) return badRequest(res, 'punches 须为非空数组');
 
+  const sameOriginal = (a, b) =>
+    a.bib === b.bib && a.point === b.point && a.seconds === b.seconds && a.kind === b.kind;
+
+  // 规范化 + 批内校验：同号异原始内容整批拒绝，完全重复只保留一条
   const rows = [];
   const seen = new Map();
   for (let i = 0; i < punches.length; i++) {
@@ -138,27 +146,36 @@ app.post('/api/punches/import', (req, res) => {
       record_no: p.recordNo.trim(), bib: p.bib.trim(), point: p.point.trim(),
       seconds: p.seconds, kind: p.kind, name: typeof p.name === 'string' ? p.name.trim() : null,
     };
-    if (seen.has(row.record_no)) {
-      const prev = seen.get(row.record_no);
-      if (prev.bib !== row.bib || prev.point !== row.point || prev.seconds !== row.seconds || prev.kind !== row.kind)
-        return badRequest(res, `记录号 ${row.record_no} 在批次内出现且内容不一致，整批拒绝`);
+    const prev = seen.get(row.record_no);
+    if (prev) {
+      if (!sameOriginal(prev, row))
+        return badRequest(res, `记录号 ${row.record_no} 在批次内出现且原始内容不一致，整批拒绝`);
       continue; // 批次内完全重复，幂等忽略
     }
     seen.set(row.record_no, row);
     rows.push(row);
   }
 
-  const existing = db.prepare('SELECT record_no, bib, point, seconds, kind FROM punch WHERE record_no = ?');
+  // 库内校验：与首次入库原始读数（orig_*）比对，而非裁判现值。
+  // 先全部判定再写入，保证混入新记录时冲突也整批不落库。
+  const existing = db.prepare(
+    `SELECT record_no, bib, orig_point AS point, orig_seconds AS seconds, kind
+     FROM punch WHERE record_no = ?`
+  );
   for (const r of rows) {
     const ex = existing.get(r.record_no);
-    if (ex && (ex.bib !== r.bib || ex.point !== r.point || ex.seconds !== r.seconds || ex.kind !== r.kind))
-      return badRequest(res, `记录号 ${r.record_no} 已存在但内容不同，整批拒绝`);
+    if (ex && !sameOriginal(ex, r))
+      return badRequest(res, `记录号 ${r.record_no} 已存在但原始内容不同，整批拒绝（更正/作废记录请以首次入库读数重导）`);
   }
 
   let inserted = 0;
   const revision = db.transaction(() => {
     const insRunner = db.prepare('INSERT INTO runner (bib, name) VALUES (?, ?) ON CONFLICT(bib) DO UPDATE SET name = COALESCE(excluded.name, runner.name)');
-    const insPunch = db.prepare('INSERT OR IGNORE INTO punch (record_no, bib, point, seconds, kind) VALUES (@record_no, @bib, @point, @seconds, @kind)');
+    // INSERT OR IGNORE：重复原始记录跳过；现值列、orig_*、status、void_reason 及审计均不被覆盖
+    const insPunch = db.prepare(
+      `INSERT OR IGNORE INTO punch (record_no, bib, point, seconds, kind, orig_point, orig_seconds)
+       VALUES (@record_no, @bib, @point, @seconds, @kind, @point, @seconds)`
+    );
     for (const r of rows) {
       insRunner.run(r.bib, r.name);
       inserted += insPunch.run(r).changes;
@@ -173,11 +190,16 @@ app.get('/api/punches', (req, res) => {
   const { bib } = req.query;
   const sql = `
     SELECT p.id, p.record_no, p.bib, r.name AS runner_name, p.point, p.seconds, p.kind,
-           p.status, p.void_reason, p.created_at
+           p.orig_point, p.orig_seconds, p.status, p.void_reason, p.created_at
     FROM punch p LEFT JOIN runner r ON r.bib = p.bib
     ${bib ? 'WHERE p.bib = ?' : ''}
     ORDER BY p.bib, p.seconds, p.id`;
   const punches = bib ? db.prepare(sql).all(bib) : db.prepare(sql).all();
+  const punchesOut = punches.map(({ orig_point, orig_seconds, ...p }) => ({
+    ...p,
+    origPoint: orig_point,
+    origSeconds: orig_seconds,
+  }));
   const auditRows = db.prepare(
     `SELECT a.* FROM punch_audit a JOIN punch p ON p.id = a.punch_id
      ${bib ? 'WHERE p.bib = ?' : ''} ORDER BY a.at, a.id`
@@ -186,7 +208,7 @@ app.get('/api/punches', (req, res) => {
     id: a.id, punchId: a.punch_id, action: a.action, origPoint: a.orig_point, origSeconds: a.orig_seconds,
     newPoint: a.new_point, newSeconds: a.new_seconds, reason: a.reason, at: a.at,
   }));
-  res.json({ punches, audits });
+  res.json({ punches: punchesOut, audits });
 });
 
 app.get('/api/results', (req, res) => {
